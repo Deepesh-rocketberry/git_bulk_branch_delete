@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------------
+# git-branch-cleaner
+# Delete git branches in the current repo, keeping the ones you pick.
+#
+# Rules:
+#   * Must be run from inside a git repo, while on the 'main' branch.
+#   * 'main' is ALWAYS protected and never deleted.
+#   * If you choose no branches to preserve (= delete ALL), you must
+#     enter the master password first.
+#   * Before any deletion happens, the delete password is required.
+#
+# Usage:
+#   git-branch-cleaner                     # interactive selection
+#   git-branch-cleaner -k "dev,release"    # preserve dev and release
+#   git-branch-cleaner -r                  # also delete on remote 'origin'
+#   git-branch-cleaner -n                  # dry run (show only)
+# ------------------------------------------------------------------
+set -uo pipefail
+
+MAIN_BRANCH="main"
+REMOTE="origin"
+
+# SHA-256 hashes of the passwords (plain-text passwords are not stored).
+MASTER_HASH="d753825c3c5735fb76399462d2ba3484374b68e1b66da3502c7c0439ed3a75a2"  # delete-all password
+DELETE_HASH="ee85b534a83efde77ecf4f22a8f03698c48940a78d9b009ab9aa97f6ccebf148"  # delete operation password
+MAX_TRIES=3
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BLUE=$'\033[0;34m'; NC=$'\033[0m'
+
+die()  { echo "${RED}Error:${NC} $*" >&2; exit 1; }
+info() { echo "${BLUE}==>${NC} $*"; }
+
+usage() {
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+hash_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  else
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'   # macOS
+  fi
+}
+
+# ask_password "<prompt>" "<expected hash>"
+ask_password() {
+  local prompt="$1" expected="$2" pw i
+  for ((i = 1; i <= MAX_TRIES; i++)); do
+    read -rsp "$prompt" pw; echo
+    if [[ "$(hash_of "$pw")" == "$expected" ]]; then
+      return 0
+    fi
+    echo "${RED}Wrong password ($i/$MAX_TRIES).${NC}"
+  done
+  die "Too many wrong attempts. Nothing was deleted."
+}
+
+in_list() {  # in_list <item> <list...>
+  local item="$1"; shift
+  local x
+  for x in "$@"; do [[ "$x" == "$item" ]] && return 0; done
+  return 1
+}
+
+# ---------------- parse options ----------------
+KEEP_ARG=""; DELETE_REMOTE=false; DRY_RUN=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -k|--keep)   [[ $# -ge 2 ]] || die "--keep needs a value"; KEEP_ARG="$2"; shift 2 ;;
+    -r|--remote) DELETE_REMOTE=true; shift ;;
+    -n|--dry-run) DRY_RUN=true; shift ;;
+    -h|--help)   usage ;;
+    *) die "Unknown option: $1 (use -h for help)" ;;
+  esac
+done
+
+# ---------------- safety checks ----------------
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository."
+
+CURRENT="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+[[ "$CURRENT" == "$MAIN_BRANCH" ]] || \
+  die "You are on '${CURRENT:-detached HEAD}'. Run 'git checkout $MAIN_BRANCH' first."
+
+REPO_NAME="$(basename "$(git rev-parse --show-toplevel)")"
+info "Repository: ${YELLOW}$REPO_NAME${NC}   Current branch: ${GREEN}$CURRENT${NC}"
+
+if $DELETE_REMOTE; then
+  git remote get-url "$REMOTE" >/dev/null 2>&1 || die "Remote '$REMOTE' not found."
+  info "Fetching from $REMOTE..."
+  git fetch "$REMOTE" --prune --quiet || die "git fetch failed."
+fi
+
+# ---------------- collect branches ----------------
+ALL=()
+while IFS= read -r b; do
+  [[ -n "$b" && "$b" != "$MAIN_BRANCH" ]] && ALL+=("$b")
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+if $DELETE_REMOTE; then
+  while IFS= read -r b; do
+    [[ -z "$b" || "$b" == "HEAD" || "$b" == "$MAIN_BRANCH" ]] && continue
+    in_list "$b" ${ALL[@]+"${ALL[@]}"} || ALL+=("$b")
+  done < <(git for-each-ref --format='%(refname:lstrip=3)' "refs/remotes/$REMOTE/")
+fi
+
+[[ ${#ALL[@]} -gt 0 ]] || { echo "${GREEN}Nothing to delete — only '$MAIN_BRANCH' exists.${NC}"; exit 0; }
+
+# ---------------- choose branches to preserve ----------------
+KEEP=()
+if [[ -n "$KEEP_ARG" ]]; then
+  IFS=',' read -ra tmp <<< "$KEEP_ARG"
+  for b in "${tmp[@]}"; do
+    b="$(echo "$b" | xargs)"
+    [[ -z "$b" ]] && continue
+    in_list "$b" "${ALL[@]}" || echo "${YELLOW}Warning:${NC} branch '$b' not found, ignored."
+    KEEP+=("$b")
+  done
+else
+  echo
+  echo "Branches (${GREEN}$MAIN_BRANCH${NC} is always protected):"
+  for i in "${!ALL[@]}"; do printf "  %2d) %s\n" $((i + 1)) "${ALL[$i]}"; done
+  echo
+  echo "Enter the numbers or names of branches to ${GREEN}PRESERVE${NC} (space separated)."
+  read -rp "Press Enter with nothing to delete ALL: " answer
+  for tok in $answer; do
+    if [[ "$tok" =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#ALL[@]} )); then
+      KEEP+=("${ALL[$((tok - 1))]}")
+    elif in_list "$tok" "${ALL[@]}"; then
+      KEEP+=("$tok")
+    else
+      echo "${YELLOW}Warning:${NC} '$tok' is not a valid choice, ignored."
+    fi
+  done
+fi
+
+# ---------------- delete-all needs master password ----------------
+VALID_KEEP=0
+for b in ${KEEP[@]+"${KEEP[@]}"}; do in_list "$b" "${ALL[@]}" && VALID_KEEP=$((VALID_KEEP + 1)); done
+
+if (( VALID_KEEP == 0 )); then
+  echo
+  echo "${RED}No branches selected to preserve — this will delete ALL branches except '$MAIN_BRANCH'.${NC}"
+  ask_password "Enter MASTER password to allow delete-all: " "$MASTER_HASH"
+  echo "${GREEN}Master password accepted.${NC}"
+fi
+
+# ---------------- build delete list ----------------
+TO_DELETE=()
+for b in "${ALL[@]}"; do
+  in_list "$b" ${KEEP[@]+"${KEEP[@]}"} || TO_DELETE+=("$b")
+done
+
+[[ ${#TO_DELETE[@]} -gt 0 ]] || { echo "${GREEN}All branches are preserved. Nothing to delete.${NC}"; exit 0; }
+
+echo
+echo "Preserved: ${GREEN}$MAIN_BRANCH${NC} ${KEEP[*]+${GREEN}${KEEP[*]}${NC}}"
+echo "${RED}To be deleted:${NC}"
+for b in "${TO_DELETE[@]}"; do echo "  - $b"; done
+$DELETE_REMOTE && echo "${YELLOW}(local AND remote '$REMOTE')${NC}"
+
+if $DRY_RUN; then
+  echo; echo "${YELLOW}Dry run — nothing deleted.${NC}"; exit 0
+fi
+
+# ---------------- delete password ----------------
+echo
+ask_password "Enter DELETE password to start deleting: " "$DELETE_HASH"
+
+# ---------------- delete ----------------
+echo
+OK=0; FAIL=0
+for b in "${TO_DELETE[@]}"; do
+  if git show-ref --verify --quiet "refs/heads/$b"; then
+    if git branch -D "$b" >/dev/null 2>&1; then
+      echo "${GREEN}✔${NC} deleted local:  $b"; OK=$((OK + 1))
+    else
+      echo "${RED}✘${NC} failed local:   $b"; FAIL=$((FAIL + 1))
+    fi
+  fi
+  if $DELETE_REMOTE && git show-ref --verify --quiet "refs/remotes/$REMOTE/$b"; then
+    if git push "$REMOTE" --delete "$b" >/dev/null 2>&1; then
+      echo "${GREEN}✔${NC} deleted remote: $REMOTE/$b"; OK=$((OK + 1))
+    else
+      echo "${RED}✘${NC} failed remote:  $REMOTE/$b (protected or no permission?)"; FAIL=$((FAIL + 1))
+    fi
+  fi
+done
+
+echo
+echo "Done. ${GREEN}$OK deleted${NC}, ${RED}$FAIL failed${NC}."
